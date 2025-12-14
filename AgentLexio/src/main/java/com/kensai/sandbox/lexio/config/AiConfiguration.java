@@ -1,6 +1,7 @@
 package com.kensai.sandbox.lexio.config;
 
 import com.kensai.sandbox.lexio.ai.assistant.LexioAssistant;
+import com.kensai.sandbox.lexio.ai.assistant.VocabularyGenerator;
 import com.kensai.sandbox.lexio.ai.tools.VocabularyExerciseTools;
 import dev.langchain4j.memory.chat.MessageWindowChatMemory;
 import dev.langchain4j.model.chat.ChatModel;
@@ -10,6 +11,13 @@ import org.springframework.context.annotation.Configuration;
 
 @Configuration
 public class AiConfiguration {
+
+    @Bean
+    public VocabularyGenerator vocabularyGenerator(ChatModel chatModel) {
+        return AiServices.builder(VocabularyGenerator.class)
+                .chatModel(chatModel)
+                .build();
+    }
 
     @Bean
     public LexioAssistant lexioAssistant(

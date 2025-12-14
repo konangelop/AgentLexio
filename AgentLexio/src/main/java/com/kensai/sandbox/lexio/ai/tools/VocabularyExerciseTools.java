@@ -1,8 +1,14 @@
 package com.kensai.sandbox.lexio.ai.tools;
 
+import com.kensai.sandbox.lexio.service.UserProfileService;
+import com.kensai.sandbox.lexio.service.UserProfileService.CefrLevel;
+import com.kensai.sandbox.lexio.service.VocabularyGenerationService;
+import com.kensai.sandbox.lexio.service.VocabularyGenerationService.GeneratedQuestion;
+import com.kensai.sandbox.lexio.web.dto.TopicAssessment;
 import com.kensai.sandbox.lexio.web.dto.exercise.*;
 import dev.langchain4j.agent.tool.P;
 import dev.langchain4j.agent.tool.Tool;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
@@ -11,44 +17,136 @@ import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 @Component
+@RequiredArgsConstructor
 public class VocabularyExerciseTools {
 
-    private final Map<String, ExerciseState> activeExercises = new ConcurrentHashMap<>();
+    private final UserProfileService userProfileService;
+    private final VocabularyGenerationService vocabularyGenerationService;
 
-    private static final List<TopicInfo> AVAILABLE_TOPICS = List.of(
-        new TopicInfo("jobs", "Arbeit und Beruf", "Jobs and Work", "A2"),
-        new TopicInfo("hobbies", "Hobbys und Freizeit", "Hobbies and Free Time", "A1"),
-        new TopicInfo("food", "Essen und Trinken", "Food and Drink", "A1"),
-        new TopicInfo("travel", "Reisen und Urlaub", "Travel and Vacation", "A2"),
-        new TopicInfo("daily_routine", "Tagesablauf", "Daily Routine", "A1"),
-        new TopicInfo("family", "Familie und Freunde", "Family and Friends", "A1")
-    );
+    private final Map<String, ExerciseState> activeExercises = new ConcurrentHashMap<>();
+    private final Map<String, PendingExercise> pendingExercises = new ConcurrentHashMap<>();
 
     @Tool("""
-        Generates a new vocabulary exercise with fill-in-the-blank sentences.
-        Call this when the user wants to practice vocabulary on specific topics.
-        Returns the exercise ID and the first question to present to the user.
+        Sets the user's German proficiency level. Call this when the user tells you their level.
+        Valid levels are: A1, A2, B1, B2, C1, C2 (CEFR scale).
+        A1 is beginner, C2 is native-like proficiency.
         """)
-    public ExerciseStartedResponse generateVocabularyExercise(
-            @P("The vocabulary topics to practice, e.g., 'jobs', 'hobbies', 'food'. Can be one or multiple topics.")
-            List<String> topics,
-            @P("Number of sentences to generate. Default to 5 if user doesn't specify. Maximum is 10.")
-            int numberOfQuestions) {
+    public String setUserLevel(
+            @P("The CEFR level: A1, A2, B1, B2, C1, or C2")
+            String level) {
+        log.info("Setting user level to: {}", level);
+        CefrLevel cefrLevel = CefrLevel.fromString(level);
+        userProfileService.setLevel(cefrLevel);
+        return String.format("Your German level has been set to %s.", cefrLevel);
+    }
 
-        log.info("Generating vocabulary exercise for topics: {}, questions: {}", topics, numberOfQuestions);
+    @Tool("""
+        Gets the user's current German proficiency level.
+        Call this when the user asks about their level or you need to check it.
+        """)
+    public String getUserLevel() {
+        CefrLevel level = userProfileService.getLevel();
+        log.info("Getting user level: {}", level);
+        return String.format("Your current German level is set to %s.", level);
+    }
+
+    @Tool("""
+        Assesses a vocabulary topic and generates exercises if appropriate.
+        Call this when the user wants to practice vocabulary on a specific topic.
+        If the topic is above the user's level, returns a warning with options.
+        If the topic is appropriate or the user confirms, generates the exercise.
+        """)
+    public Object generateVocabularyExercise(
+            @P("The vocabulary topic to practice, e.g., 'legal terms', 'cooking', 'sports'. Can be any topic.")
+            String topic,
+            @P("Number of sentences to generate. Default to 5 if user doesn't specify. Maximum is 10.")
+            int numberOfQuestions,
+            @P("Set to true if the user has already been warned about difficulty and wants to proceed anyway")
+            boolean proceedDespiteWarning) {
+
+        log.info("Generating vocabulary exercise for topic: {}, questions: {}, proceedDespiteWarning: {}",
+                topic, numberOfQuestions, proceedDespiteWarning);
 
         int questionsCount = Math.min(Math.max(numberOfQuestions, 1), 10);
-        String exerciseId = UUID.randomUUID().toString().substring(0, 8);
-        List<QuestionData> questions = generateSampleSentences(topics, questionsCount);
 
-        ExerciseState state = new ExerciseState(exerciseId, topics, questions);
+        // Assess the topic difficulty
+        TopicAssessment assessment = vocabularyGenerationService.assessTopic(topic);
+        CefrLevel topicLevel = CefrLevel.fromString(assessment.assessedLevel());
+        CefrLevel userLevel = userProfileService.getLevel();
+
+        log.info("Topic '{}' assessed at {} level, user is at {} level", topic, topicLevel, userLevel);
+
+        // Check if topic is too advanced
+        if (!proceedDespiteWarning && userLevel.isLowerThan(topicLevel)) {
+            String pendingId = UUID.randomUUID().toString().substring(0, 8);
+            pendingExercises.put(pendingId, new PendingExercise(topic, questionsCount, topicLevel.name()));
+
+            String warning = String.format(
+                "The topic '%s' is typically at %s level, but your current level is %s. " +
+                "This might be challenging! Would you like to:\n" +
+                "1. Continue anyway (I'll adjust the vocabulary to be more accessible)\n" +
+                "2. Try a simpler topic%s",
+                topic, topicLevel, userLevel,
+                assessment.suggestedSimplerTopic() != null
+                    ? " (suggested: " + assessment.suggestedSimplerTopic() + ")"
+                    : ""
+            );
+
+            return new TopicWarningResponse(
+                topic,
+                topicLevel.name(),
+                userLevel.name(),
+                warning,
+                assessment.suggestedSimplerTopic(),
+                false
+            );
+        }
+
+        // Generate the exercise
+        return createExercise(topic, questionsCount, userLevel.name());
+    }
+
+    @Tool("""
+        Confirms that the user wants to proceed with a difficult topic after being warned.
+        Call this when the user says they want to continue despite the topic being above their level.
+        """)
+    public ExerciseStartedResponse confirmDifficultTopic(
+            @P("The topic that was previously assessed as difficult")
+            String topic,
+            @P("Number of questions for the exercise")
+            int numberOfQuestions) {
+
+        log.info("User confirmed difficult topic: {}", topic);
+        CefrLevel userLevel = userProfileService.getLevel();
+        return createExercise(topic, numberOfQuestions, userLevel.name());
+    }
+
+    private ExerciseStartedResponse createExercise(String topic, int questionsCount, String level) {
+        String exerciseId = UUID.randomUUID().toString().substring(0, 8);
+
+        // Generate questions using AI
+        List<GeneratedQuestion> generatedQuestions =
+            vocabularyGenerationService.generateQuestions(topic, level, questionsCount);
+
+        // Convert to internal QuestionData format
+        List<QuestionData> questions = generatedQuestions.stream()
+            .map(gq -> new QuestionData(
+                gq.sentenceWithBlank(),
+                gq.completeSentence(),
+                gq.targetWord(),
+                gq.englishWord(),
+                gq.englishTranslation()
+            ))
+            .toList();
+
+        ExerciseState state = new ExerciseState(exerciseId, List.of(topic), questions);
         activeExercises.put(exerciseId, state);
 
         QuestionData firstQuestion = questions.get(0);
         return new ExerciseStartedResponse(
             exerciseId,
             1,
-            questionsCount,
+            questions.size(),
             firstQuestion.sentenceWithBlank()
         );
     }
@@ -178,15 +276,6 @@ public class VocabularyExerciseTools {
         return state.getSummary();
     }
 
-    @Tool("""
-        Lists all available vocabulary topics that users can practice.
-        Call this when the user asks what topics are available or wants suggestions.
-        """)
-    public List<TopicInfo> listAvailableTopics() {
-        log.info("Listing available topics");
-        return AVAILABLE_TOPICS;
-    }
-
     private String normalizeAnswer(String answer) {
         if (answer == null) return "";
         String normalized = answer.trim().toLowerCase();
@@ -194,143 +283,9 @@ public class VocabularyExerciseTools {
         return normalized;
     }
 
-    private List<QuestionData> generateSampleSentences(List<String> topics, int count) {
-        List<QuestionData> allSentences = new ArrayList<>();
-
-        if (topics.stream().anyMatch(t -> t.toLowerCase().contains("job") || t.toLowerCase().contains("work") || t.toLowerCase().contains("beruf"))) {
-            allSentences.addAll(List.of(
-                new QuestionData(
-                    "Mein Bruder arbeitet als ___ in einem Krankenhaus.",
-                    "Mein Bruder arbeitet als Arzt in einem Krankenhaus.",
-                    "Arzt", "doctor",
-                    "My brother works as a ___ in a hospital."
-                ),
-                new QuestionData(
-                    "Sie ist ___ und unterrichtet Mathematik an einer Schule.",
-                    "Sie ist Lehrerin und unterrichtet Mathematik an einer Schule.",
-                    "Lehrerin", "teacher",
-                    "She is a ___ and teaches mathematics at a school."
-                ),
-                new QuestionData(
-                    "Der ___ repariert jeden Tag viele Autos in seiner Werkstatt.",
-                    "Der Mechaniker repariert jeden Tag viele Autos in seiner Werkstatt.",
-                    "Mechaniker", "mechanic",
-                    "The ___ repairs many cars every day in his workshop."
-                ),
-                new QuestionData(
-                    "Meine Mutter arbeitet als ___ in einem großen Büro.",
-                    "Meine Mutter arbeitet als Sekretärin in einem großen Büro.",
-                    "Sekretärin", "secretary",
-                    "My mother works as a ___ in a large office."
-                ),
-                new QuestionData(
-                    "Nach dem Studium möchte er ___ werden und Häuser entwerfen.",
-                    "Nach dem Studium möchte er Architekt werden und Häuser entwerfen.",
-                    "Architekt", "architect",
-                    "After his studies, he wants to become an ___ and design houses."
-                )
-            ));
-        }
-
-        if (topics.stream().anyMatch(t -> t.toLowerCase().contains("hobb") || t.toLowerCase().contains("freizeit"))) {
-            allSentences.addAll(List.of(
-                new QuestionData(
-                    "In meiner Freizeit spiele ich gern ___ mit meinen Freunden.",
-                    "In meiner Freizeit spiele ich gern Fußball mit meinen Freunden.",
-                    "Fußball", "football/soccer",
-                    "In my free time, I like to play ___ with my friends."
-                ),
-                new QuestionData(
-                    "Am Wochenende gehe ich oft ___, um fit zu bleiben.",
-                    "Am Wochenende gehe ich oft schwimmen, um fit zu bleiben.",
-                    "schwimmen", "swimming",
-                    "On weekends, I often go ___ to stay fit."
-                ),
-                new QuestionData(
-                    "Mein liebstes Hobby ist das ___ von Büchern.",
-                    "Mein liebstes Hobby ist das Lesen von Büchern.",
-                    "Lesen", "reading",
-                    "My favorite hobby is ___ books."
-                ),
-                new QuestionData(
-                    "Sie ___ jeden Abend Klavier, weil sie Musik liebt.",
-                    "Sie spielt jeden Abend Klavier, weil sie Musik liebt.",
-                    "spielt", "plays",
-                    "She ___ piano every evening because she loves music."
-                ),
-                new QuestionData(
-                    "Im Sommer gehen wir oft ___ in den Bergen.",
-                    "Im Sommer gehen wir oft wandern in den Bergen.",
-                    "wandern", "hiking",
-                    "In summer, we often go ___ in the mountains."
-                )
-            ));
-        }
-
-        if (topics.stream().anyMatch(t -> t.toLowerCase().contains("food") || t.toLowerCase().contains("essen"))) {
-            allSentences.addAll(List.of(
-                new QuestionData(
-                    "Zum Frühstück esse ich gern ___ mit Butter und Marmelade.",
-                    "Zum Frühstück esse ich gern Brot mit Butter und Marmelade.",
-                    "Brot", "bread",
-                    "For breakfast, I like to eat ___ with butter and jam."
-                ),
-                new QuestionData(
-                    "In Deutschland trinkt man viel ___, besonders am Morgen.",
-                    "In Deutschland trinkt man viel Kaffee, besonders am Morgen.",
-                    "Kaffee", "coffee",
-                    "In Germany, people drink a lot of ___, especially in the morning."
-                ),
-                new QuestionData(
-                    "Mein Lieblingsessen ist ___ mit Pommes und Salat.",
-                    "Mein Lieblingsessen ist Schnitzel mit Pommes und Salat.",
-                    "Schnitzel", "schnitzel",
-                    "My favorite food is ___ with fries and salad."
-                ),
-                new QuestionData(
-                    "Kannst du mir bitte das ___ geben? Mein Essen ist nicht salzig genug.",
-                    "Kannst du mir bitte das Salz geben? Mein Essen ist nicht salzig genug.",
-                    "Salz", "salt",
-                    "Can you please pass me the ___? My food isn't salty enough."
-                ),
-                new QuestionData(
-                    "Zum Nachtisch möchte ich einen ___ mit Sahne.",
-                    "Zum Nachtisch möchte ich einen Kuchen mit Sahne.",
-                    "Kuchen", "cake",
-                    "For dessert, I would like a ___ with cream."
-                )
-            ));
-        }
-
-        // Generic sentences as fallback
-        if (allSentences.size() < count) {
-            allSentences.addAll(List.of(
-                new QuestionData(
-                    "Das ___ ist heute sehr schön, wir sollten spazieren gehen.",
-                    "Das Wetter ist heute sehr schön, wir sollten spazieren gehen.",
-                    "Wetter", "weather",
-                    "The ___ is very nice today, we should go for a walk."
-                ),
-                new QuestionData(
-                    "Ich muss zum ___ gehen, um Milch und Eier zu kaufen.",
-                    "Ich muss zum Supermarkt gehen, um Milch und Eier zu kaufen.",
-                    "Supermarkt", "supermarket",
-                    "I need to go to the ___ to buy milk and eggs."
-                ),
-                new QuestionData(
-                    "Meine ___ ist sehr groß. Ich habe drei Brüder und zwei Schwestern.",
-                    "Meine Familie ist sehr groß. Ich habe drei Brüder und zwei Schwestern.",
-                    "Familie", "family",
-                    "My ___ is very large. I have three brothers and two sisters."
-                )
-            ));
-        }
-
-        Collections.shuffle(allSentences);
-        return allSentences.subList(0, Math.min(count, allSentences.size()));
-    }
-
     // Inner classes for state management
+
+    private record PendingExercise(String topic, int questionCount, String topicLevel) {}
 
     private static class ExerciseState {
         private final String id;
